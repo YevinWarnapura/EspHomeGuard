@@ -12,14 +12,62 @@
 #include "ultrasonic.h"
 #include "keypad.h"
 #include "speaker.h"
-#include "led.h"        // <-- ADDED
-#include "remote.h"     // <-- you will add later (stub is fine)
+#include "led.h"
+#include "remote.h"
 
+// ==== NEW INCLUDES FOR WIFI + MQTT ====
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "mqtt_client.h"
+#include "lwip/err.h"
+#include "lwip/sys.h"
 
 // =========================
 // Global logging tag
 // =========================
 static const char* TAG = "ALARM_MAIN";
+
+// =========================
+// WiFi + MQTT config
+// =========================
+#define WIFI_SSID "NOKIA-1580"
+#define WIFI_PASS "unitthree"
+
+// EMQX Serverless TLS endpoint
+static const char* MQTT_URI = "mqtts://s66a1a0e.ala.us-east-1.emqxsl.com:8883";
+
+// MQTT topics
+static const char* TOPIC_CMD       = "alarm/cmd";
+static const char* TOPIC_TELEMETRY = "alarm/telemetry";
+
+// CA certificate from emqxsl-ca.crt
+// Paste entire file contents (including BEGIN/END lines) inside the string:
+static const char EMQX_CA_CERT_PEM[] = R"(-----BEGIN CERTIFICATE-----
+MIIDjjCCAnagAwIBAgIQAzrx5qcRqaC7KGSxHQn65TANBgkqhkiG9w0BAQsFADBh
+MQswCQYDVQQGEwJVUzEVMBMGA1UEChMMRGlnaUNlcnQgSW5jMRkwFwYDVQQLExB3
+d3cuZGlnaWNlcnQuY29tMSAwHgYDVQQDExdEaWdpQ2VydCBHbG9iYWwgUm9vdCBH
+MjAeFw0xMzA4MDExMjAwMDBaFw0zODAxMTUxMjAwMDBaMGExCzAJBgNVBAYTAlVT
+MRUwEwYDVQQKEwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5j
+b20xIDAeBgNVBAMTF0RpZ2lDZXJ0IEdsb2JhbCBSb290IEcyMIIBIjANBgkqhkiG
+9w0BAQEFAAOCAQ8AMIIBCgKCAQEAuzfNNNx7a8myaJCtSnX/RrohCgiN9RlUyfuI
+2/Ou8jqJkTx65qsGGmvPrC3oXgkkRLpimn7Wo6h+4FR1IAWsULecYxpsMNzaHxmx
+1x7e/dfgy5SDN67sH0NO3Xss0r0upS/kqbitOtSZpLYl6ZtrAGCSYP9PIUkY92eQ
+q2EGnI/yuum06ZIya7XzV+hdG82MHauVBJVJ8zUtluNJbd134/tJS7SsVQepj5Wz
+tCO7TG1F8PapspUwtP1MVYwnSlcUfIKdzXOS0xZKBgyMUNGPHgm+F6HmIcr9g+UQ
+vIOlCsRnKPZzFBQ9RnbDhxSJITRNrw9FDKZJobq7nMWxM4MphQIDAQABo0IwQDAP
+BgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwIBhjAdBgNVHQ4EFgQUTiJUIBiV
+5uNu5g/6+rkS7QYXjzkwDQYJKoZIhvcNAQELBQADggEBAGBnKJRvDkhj6zHd6mcY
+1Yl9PMWLSn/pvtsrF9+wX3N3KjITOYFnQoQj8kVnNeyIv/iPsGEMNKSuIEyExtv4
+NeF22d+mQrvHRAiGfzZ0JFrabA0UWTW98kndth/Jsw1HKj2ZL7tcu7XUIOGZX1NG
+Fdtom/DzMNU+MeKNhJ7jitralj41E6Vf8PlwUHBHQRFXGU7Aj64GxJUTFy8bJZ91
+8rGOmaFvE7FBcf6IKshPECBV1/MUReXgRPTqh5Uykw7+U0b6LJ3/iyK5S9kJRaTe
+pLiaWN0bfVKfjllDiIGknibVb63dDcY3fe0Dkhvld1927jyNxF1WW6LZZm6zNTfl
+MrY=
+-----END CERTIFICATE-----)";
+
+// MQTT client handle
+static esp_mqtt_client_handle_t g_mqtt_client = nullptr;
 
 
 // =========================
@@ -58,6 +106,9 @@ static const int EXIT_DELAY_MS = 15000;
 static TickType_t g_exit_deadline = 0;
 static int g_exit_seconds_remaining = 0;
 
+// last ultrasonic distance (for telemetry)
+static int g_last_distance_cm = -1;
+
 
 // =========================
 // Forward declarations
@@ -68,8 +119,11 @@ void ultrasonic_task(void* pv);
 void keypad_task(void* pv);
 void speaker_task(void* pv);
 void led_task(void* pv);
+// remote_task is no longer used for MQTT-based remote, but we keep it if
+// you want to simulate IR remote etc.
 void remote_task(void* pv);
 void lcd_task(void* pv);
+void mqtt_task(void* pv);  // NEW
 
 
 // =========================
@@ -82,6 +136,150 @@ void led_set_alarm();
 void led_set_exit_delay_level(int sec_left);
 
 RemoteCommandType remote_check_command();
+
+
+// =========================
+// WIFI INIT (STA MODE)
+// =========================
+
+static void wifi_event_handler(void* arg, esp_event_base_t event_base,
+                               int32_t event_id, void* event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT &&
+               event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        ESP_LOGW(TAG, "WiFi disconnected, reconnecting...");
+        esp_wifi_connect();
+    } else if (event_base == IP_EVENT &&
+               event_id == IP_EVENT_STA_GOT_IP) {
+        ESP_LOGI(TAG, "WiFi connected + got IP");
+    }
+}
+
+static void wifi_init_sta()
+{
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
+
+    wifi_config_t wifi_config = {};
+    strncpy((char*)wifi_config.sta.ssid, WIFI_SSID, sizeof(wifi_config.sta.ssid));
+    strncpy((char*)wifi_config.sta.password, WIFI_PASS, sizeof(wifi_config.sta.password));
+    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_LOGI(TAG, "WiFi STA init done");
+}
+
+
+// =========================
+// MQTT EVENT HANDLER
+// =========================
+
+static void mqtt_publish_state()
+{
+    if (!g_mqtt_client) return;
+
+    AlarmState s = g_state;
+    const char* state_str = "DISARMED";
+    switch (s) {
+        case AlarmState::DISARMED:  state_str = "DISARMED";  break;
+        case AlarmState::EXIT_DELAY:state_str = "EXIT_DELAY";break;
+        case AlarmState::ARMED:     state_str = "ARMED";     break;
+        case AlarmState::ALARM:     state_str = "ALARM";     break;
+    }
+
+    char payload[128];
+    snprintf(payload, sizeof(payload),
+             "{\"state\":\"%s\",\"distance_cm\":%d}",
+             state_str, g_last_distance_cm);
+
+    int msg_id = esp_mqtt_client_publish(
+        g_mqtt_client, TOPIC_TELEMETRY, payload, 0, 1, 0);
+
+    ESP_LOGI(TAG, "MQTT publish telemetry msg_id=%d: %s", msg_id, payload);
+}
+
+static void mqtt_arm_disarm_from_cmd(const char* cmd, int len)
+{
+    std::string c(cmd, cmd + len);
+
+    if (c == "ARM") {
+        AlarmEvent ev{ AlarmEventType::ARM_REMOTE };
+        xQueueSend(g_eventQueue, &ev, 0);
+        ESP_LOGI(TAG, "MQTT: ARM command received");
+    } else if (c == "DISARM") {
+        AlarmEvent ev{ AlarmEventType::DISARM_REMOTE };
+        xQueueSend(g_eventQueue, &ev, 0);
+        ESP_LOGI(TAG, "MQTT: DISARM command received");
+    } else {
+        ESP_LOGW(TAG, "MQTT: Unknown cmd '%s'", c.c_str());
+    }
+}
+
+static void mqtt_event_handler(void* handler_args,
+                               esp_event_base_t base,
+                               int32_t event_id,
+                               void* event_data)
+{
+    esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t) event_data;
+
+    switch (event->event_id) {
+        case MQTT_EVENT_CONNECTED:
+            ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
+            esp_mqtt_client_subscribe(g_mqtt_client, TOPIC_CMD, 1);
+            break;
+
+        case MQTT_EVENT_DISCONNECTED:
+            ESP_LOGW(TAG, "MQTT_EVENT_DISCONNECTED");
+            break;
+
+        case MQTT_EVENT_DATA: {
+            ESP_LOGI(TAG, "MQTT_EVENT_DATA: topic=%.*s data=%.*s",
+                     event->topic_len, event->topic,
+                     event->data_len, event->data);
+
+            // check if this is the command topic
+            std::string topic(event->topic, event->topic + event->topic_len);
+            if (topic == TOPIC_CMD) {
+                mqtt_arm_disarm_from_cmd(event->data, event->data_len);
+            }
+            break;
+        }
+
+        default:
+            break;
+    }
+}
+
+static void mqtt_init()
+{
+    esp_mqtt_client_config_t mqtt_cfg = {};
+    mqtt_cfg.broker.address.uri = MQTT_URI;
+    mqtt_cfg.credentials.username = "homeGuard";
+    mqtt_cfg.credentials.authentication.password = "gurrKash67cutwater"; 
+    mqtt_cfg.broker.verification.certificate = EMQX_CA_CERT_PEM;
+
+    g_mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
+    ESP_ERROR_CHECK(esp_mqtt_client_register_event(
+        g_mqtt_client, (esp_mqtt_event_id_t)ESP_EVENT_ANY_ID,
+        mqtt_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_mqtt_client_start(g_mqtt_client));
+
+    ESP_LOGI(TAG, "MQTT client started");
+}
 
 
 // =========================
@@ -115,7 +313,6 @@ void alarm_task(void* pv)
                     }
                     break;
 
-
                 case AlarmState::EXIT_DELAY:
                     if (ev.type == AlarmEventType::DISARM_PIN_OK ||
                         ev.type == AlarmEventType::DISARM_OVERRIDE ||
@@ -126,7 +323,6 @@ void alarm_task(void* pv)
                         ESP_LOGI(TAG, "Exit delay cancelled");
                     }
                     break;
-
 
                 case AlarmState::ARMED:
                     if (ev.type == AlarmEventType::MOTION_DETECTED)
@@ -145,7 +341,6 @@ void alarm_task(void* pv)
                     }
                     break;
 
-
                 case AlarmState::ALARM:
                     if (ev.type == AlarmEventType::DISARM_PIN_OK ||
                         ev.type == AlarmEventType::DISARM_OVERRIDE ||
@@ -158,10 +353,13 @@ void alarm_task(void* pv)
                     break;
             }
 
-            if (old != g_state)
-                ESP_LOGI(TAG, "STATE CHANGE: %d -> %d", (int)old, (int)g_state);
+            if (old != g_state) {
+                ESP_LOGI(TAG, "STATE CHANGE: %d -> %d",
+                         (int)old, (int)g_state);
+                // whenever state changes, push telemetry
+                mqtt_publish_state();
+            }
         }
-
 
         // TIMER HANDLING FOR EXIT DELAY
         if (g_state == AlarmState::EXIT_DELAY)
@@ -174,6 +372,7 @@ void alarm_task(void* pv)
                 lcd_show_message("ARMED");
                 g_exit_seconds_remaining = 0;
                 ESP_LOGI(TAG, "System ARMED");
+                mqtt_publish_state();
             }
             else
             {
@@ -199,6 +398,7 @@ void ultrasonic_task(void* pv)
     while (true)
     {
         int dist_cm = ultrasonic_get_distance_cm();
+        g_last_distance_cm = dist_cm;  // for telemetry
 
         if (dist_cm > 0 && dist_cm <= 100)
         {
@@ -213,11 +413,13 @@ void ultrasonic_task(void* pv)
 
 // =========================
 // Keypad Task
+// (unchanged except uses event queue)
 // =========================
 
-// =========================
-// Keypad Task
-// =========================
+// ... keep your existing keypad_task exactly as in original file ...
+
+// [FOR BREVITY: paste your existing keypad_task implementation here,
+// it’s unchanged from your current code.]
 
 void keypad_task(void* pv)
 {
@@ -235,19 +437,13 @@ void keypad_task(void* pv)
         {
             ESP_LOGI("KEYPAD", "Key: %c", key);
 
-            // ================================
-            // ARM SYSTEM (A KEY) when not entering PIN
-            // ================================
             if (key == ARM_KEY && !entering_pin)
             {
                 AlarmEvent ev{ AlarmEventType::ARM_LOCAL };
                 xQueueSend(g_eventQueue, &ev, 0);
-                // You can also give a message here if you want:
-                // lcd_show_message("EXIT DELAY");
                 continue;
             }
 
-            // If we get here and we're not in PIN mode yet, enter it
             if (!entering_pin)
             {
                 entering_pin = true;
@@ -257,12 +453,9 @@ void keypad_task(void* pv)
                 lcd_clear();
                 lcd_show_message("ENTER PIN:");
                 lcd_set_cursor(0, 1);
-                lcd_write_string("    ");   // clear 2nd line
+                lcd_write_string("    ");
             }
 
-            // ================================
-            // CLEAR WITH *
-            // ================================
             if (key == '*')
             {
                 idx = 0;
@@ -275,9 +468,6 @@ void keypad_task(void* pv)
                 continue;
             }
 
-            // ================================
-            // ENTER WITH #
-            // ================================
             if (key == '#')
             {
                 if (idx == 4)
@@ -314,30 +504,25 @@ void keypad_task(void* pv)
                     lcd_write_string("    ");
                 }
 
-                // reset after pressing #
                 entering_pin = false;
                 idx = 0;
                 memset(buffer, 0, sizeof(buffer));
                 continue;
             }
 
-            // ================================
-            // DIGITS ONLY
-            // ================================
             if (key >= '0' && key <= '9')
             {
                 if (idx < 4)
                 {
                     buffer[idx++] = key;
 
-                    // build stars string
-                    char stars[5] = "    ";   // 4 chars + null
+                    char stars[5] = "    ";
                     for (int i = 0; i < idx; i++)
                         stars[i] = '*';
 
                     lcd_clear();
                     lcd_show_message("ENTER PIN:");
-                    lcd_set_cursor(0, 1);      // second line
+                    lcd_set_cursor(0, 1);
                     lcd_write_string(stars);
                 }
             }
@@ -348,9 +533,8 @@ void keypad_task(void* pv)
 }
 
 
-
 // =========================
-// Speaker Task
+// Speaker Task (unchanged)
 // =========================
 
 extern void speaker_update();
@@ -397,7 +581,7 @@ void speaker_task(void* pv)
 
 
 // =========================
-// LED Task
+// LED Task (unchanged)
 // =========================
 
 void led_task(void* pv)
@@ -437,13 +621,29 @@ void led_task(void* pv)
 
 
 // =========================
-// Remote Task
+// MQTT Task
+// Periodically publishes telemetry
+// =========================
+
+void mqtt_task(void* pv)
+{
+    while (true)
+    {
+        mqtt_publish_state();
+        vTaskDelay(pdMS_TO_TICKS(2000));  // every 2s
+    }
+}
+
+
+// =========================
+// Remote Task (optional stub)
 // =========================
 
 void remote_task(void* pv)
 {
     while (true)
     {
+        // keep if you'd like to still support the old stub IR remote.
         RemoteCommandType cmd = remote_check_command();
 
         if (cmd == RemoteCommandType::ARM)
@@ -481,18 +681,20 @@ void lcd_task(void* pv)
 
 extern "C" void app_main(void)
 {
-
-    nvs_flash_erase();
-    nvs_flash_init();
+    ESP_ERROR_CHECK(nvs_flash_init());
 
     ESP_LOGI(TAG, "Smart Home Alarm – RTOS core starting");
+
+    wifi_init_sta();  // NEW
+    vTaskDelay(pdMS_TO_TICKS(2000)); // give WiFi time
+
+    mqtt_init();      // NEW
 
     ultrasonic_init();
     keypad_init();
     lcd_init();
     speaker_init();
-
-    led_init();    // <-- REQUIRED FOR LED DRIVER
+    led_init();
 
     g_eventQueue = xQueueCreate(16, sizeof(AlarmEvent));
     if (!g_eventQueue)
@@ -506,8 +708,9 @@ extern "C" void app_main(void)
     xTaskCreate(keypad_task,    "keypad_task",    4096, nullptr, 7,  nullptr);
     xTaskCreate(speaker_task,   "speaker_task",   2048, nullptr, 6,  nullptr);
     xTaskCreate(led_task,       "led_task",       2048, nullptr, 5,  nullptr);
-    xTaskCreate(remote_task,    "remote_task",    2048, nullptr, 4,  nullptr);
-    xTaskCreate(lcd_task,       "lcd_task",       2048, nullptr, 3,  nullptr);
+    xTaskCreate(mqtt_task,      "mqtt_task",      4096, nullptr, 4,  nullptr);
+    xTaskCreate(remote_task,    "remote_task",    2048, nullptr, 3,  nullptr);
+    xTaskCreate(lcd_task,       "lcd_task",       2048, nullptr, 2,  nullptr);
 
     ESP_LOGI(TAG, "RTOS core running.");
 }
