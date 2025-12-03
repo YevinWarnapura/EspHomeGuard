@@ -52,12 +52,10 @@ void speaker_set_alarm(bool on)
         ledc_set_freq(LEDC_LOW_SPEED_MODE, LEDC_TIMER_0, ALARM_FREQ);
         ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, PWM_DUTY);
         ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
-        ESP_LOGI(TAG, "ALARM ON");
     } else {
         // Stop tone
         ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
         ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
-        ESP_LOGI(TAG, "ALARM OFF");
     }
 }
 

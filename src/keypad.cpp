@@ -19,7 +19,6 @@ static const char* TAG = "KEYPAD";
 // (Matches your physical wiring)
 // ============================
 
-// ROW pins (outputs)
 static gpio_num_t rowPins[ROWS] = {
     GPIO_NUM_13,  // R1
     GPIO_NUM_12,  // R2
@@ -47,8 +46,7 @@ static const char keymap[ROWS][COLS] = {
 // ============================
 // PIN STORAGE (NVS)
 // ============================
-
-static char g_pin[5] = "1234";
+static char g_pin[5] = "1231";  // default PIN  
 
 static void load_pin_from_nvs() {
 

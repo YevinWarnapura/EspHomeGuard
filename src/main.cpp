@@ -5,6 +5,8 @@
 #include "freertos/queue.h"
 #include "esp_log.h"
 #include <cstring>
+#include <string>
+#include "nvs_flash.h"
 
 #include "lcd.h"
 #include "ultrasonic.h"
@@ -213,13 +215,17 @@ void ultrasonic_task(void* pv)
 // Keypad Task
 // =========================
 
+// =========================
+// Keypad Task
+// =========================
+
 void keypad_task(void* pv)
 {
     char buffer[5] = {0};
     int idx = 0;
+    bool entering_pin = false;
 
     const char ARM_KEY = 'A';
-    const char OVERRIDE_KEY = 'D';
 
     while (true)
     {
@@ -227,22 +233,52 @@ void keypad_task(void* pv)
 
         if (key != 0)
         {
-            if (key == ARM_KEY)
+            ESP_LOGI("KEYPAD", "Key: %c", key);
+
+            // ================================
+            // ARM SYSTEM (A KEY) when not entering PIN
+            // ================================
+            if (key == ARM_KEY && !entering_pin)
             {
                 AlarmEvent ev{ AlarmEventType::ARM_LOCAL };
                 xQueueSend(g_eventQueue, &ev, 0);
+                // You can also give a message here if you want:
+                // lcd_show_message("EXIT DELAY");
+                continue;
             }
-            else if (key == OVERRIDE_KEY)
+
+            // If we get here and we're not in PIN mode yet, enter it
+            if (!entering_pin)
             {
-                AlarmEvent ev{ AlarmEventType::DISARM_OVERRIDE };
-                xQueueSend(g_eventQueue, &ev, 0);
+                entering_pin = true;
+                idx = 0;
+                memset(buffer, 0, sizeof(buffer));
+
+                lcd_clear();
+                lcd_show_message("ENTER PIN:");
+                lcd_set_cursor(0, 1);
+                lcd_write_string("    ");   // clear 2nd line
             }
-            else if (key >= '0' && key <= '9')
+
+            // ================================
+            // CLEAR WITH *
+            // ================================
+            if (key == '*')
             {
-                if (idx < 4)
-                    buffer[idx++] = key;
+                idx = 0;
+                memset(buffer, 0, sizeof(buffer));
+
+                lcd_clear();
+                lcd_show_message("ENTER PIN:");
+                lcd_set_cursor(0, 1);
+                lcd_write_string("    ");
+                continue;
             }
-            else if (key == '#')
+
+            // ================================
+            // ENTER WITH #
+            // ================================
+            if (key == '#')
             {
                 if (idx == 4)
                 {
@@ -250,17 +286,67 @@ void keypad_task(void* pv)
                     {
                         AlarmEvent ev{ AlarmEventType::DISARM_PIN_OK };
                         xQueueSend(g_eventQueue, &ev, 0);
+
+                        lcd_clear();
+                        lcd_show_message("DISARMED");
+                    }
+                    else
+                    {
+                        lcd_clear();
+                        lcd_show_message("WRONG PIN");
+                        vTaskDelay(pdMS_TO_TICKS(1000));
+
+                        lcd_clear();
+                        lcd_show_message("ENTER PIN:");
+                        lcd_set_cursor(0, 1);
+                        lcd_write_string("    ");
                     }
                 }
+                else
+                {
+                    lcd_clear();
+                    lcd_show_message("NEED 4 DIGITS");
+                    vTaskDelay(pdMS_TO_TICKS(700));
 
-                memset(buffer, 0, sizeof(buffer));
+                    lcd_clear();
+                    lcd_show_message("ENTER PIN:");
+                    lcd_set_cursor(0, 1);
+                    lcd_write_string("    ");
+                }
+
+                // reset after pressing #
+                entering_pin = false;
                 idx = 0;
+                memset(buffer, 0, sizeof(buffer));
+                continue;
+            }
+
+            // ================================
+            // DIGITS ONLY
+            // ================================
+            if (key >= '0' && key <= '9')
+            {
+                if (idx < 4)
+                {
+                    buffer[idx++] = key;
+
+                    // build stars string
+                    char stars[5] = "    ";   // 4 chars + null
+                    for (int i = 0; i < idx; i++)
+                        stars[i] = '*';
+
+                    lcd_clear();
+                    lcd_show_message("ENTER PIN:");
+                    lcd_set_cursor(0, 1);      // second line
+                    lcd_write_string(stars);
+                }
             }
         }
 
-        vTaskDelay(pdMS_TO_TICKS(40));
+        vTaskDelay(pdMS_TO_TICKS(30));
     }
 }
+
 
 
 // =========================
@@ -395,6 +481,10 @@ void lcd_task(void* pv)
 
 extern "C" void app_main(void)
 {
+
+    nvs_flash_erase();
+    nvs_flash_init();
+
     ESP_LOGI(TAG, "Smart Home Alarm – RTOS core starting");
 
     ultrasonic_init();

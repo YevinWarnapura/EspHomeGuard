@@ -5,9 +5,17 @@
 #include "driver/i2c.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "esp_log.h"
 
 static const char* TAG_LCD = "LCD_I2C";
+
+// Global mutex for LCD access
+SemaphoreHandle_t lcd_mutex = nullptr;
+
+// Simple macros to lock/unlock
+#define LCD_LOCK()   do { if (lcd_mutex) xSemaphoreTake(lcd_mutex, portMAX_DELAY); } while (0)
+#define LCD_UNLOCK() do { if (lcd_mutex) xSemaphoreGive(lcd_mutex); } while (0)
 
 // -------------------------
 // I2C configuration
@@ -20,7 +28,6 @@ static const char* TAG_LCD = "LCD_I2C";
 
 // -------------------------
 // PCF8574 pin mapping
-// (Typical modules: adapt if yours is different)
 // -------------------------
 //
 // P0 -> RS
@@ -67,7 +74,7 @@ static void lcd_write_nibble(uint8_t nibble, bool rs)
 {
     uint8_t data = 0;
 
-    if (rs)       data |= LCD_RS;
+    if (rs)          data |= LCD_RS;
     if (s_backlight) data |= LCD_BL;
 
     if (nibble & 0x01) data |= LCD_D4;
@@ -112,6 +119,14 @@ void lcd_init()
 {
     ESP_LOGI(TAG_LCD, "Initializing I2C LCD...");
 
+    // Create mutex once
+    if (lcd_mutex == nullptr) {
+        lcd_mutex = xSemaphoreCreateMutex();
+        if (!lcd_mutex) {
+            ESP_LOGE(TAG_LCD, "Failed to create LCD mutex!");
+        }
+    }
+
     // I2C config
     i2c_config_t conf = {};
     conf.mode = I2C_MODE_MASTER;
@@ -125,6 +140,8 @@ void lcd_init()
     ESP_ERROR_CHECK(i2c_driver_install(I2C_PORT, conf.mode, 0, 0, 0));
 
     vTaskDelay(pdMS_TO_TICKS(50)); // wait for LCD power-up
+
+    // We don't lock here because no other task uses LCD before init completes
 
     // Initialization sequence for HD44780 in 4-bit mode
     lcd_write_nibble(0x03, false);
@@ -152,12 +169,15 @@ void lcd_init()
 
 void lcd_clear()
 {
+    LCD_LOCK();
     lcd_send_cmd(0x01);
     vTaskDelay(pdMS_TO_TICKS(2));
+    LCD_UNLOCK();
 }
 
 void lcd_set_cursor(int col, int row)
 {
+    // ⚠ Not locked: used inside already-locked high-level functions and by keypad
     if (col < 0) col = 0;
     if (col > 15) col = 15;
     if (row < 0) row = 0;
@@ -170,40 +190,79 @@ void lcd_set_cursor(int col, int row)
 
 void lcd_write_char(char c)
 {
+    // ⚠ Not locked: assume caller handles concurrency
     lcd_send_data((uint8_t)c);
 }
 
 void lcd_write_string(const char* str)
 {
+    // ⚠ Not locked: assume caller handles concurrency
     while (*str) {
         lcd_write_char(*str++);
     }
 }
 
-// High-level helper: show text on first line only
+// High-level helper: show text on both lines, safely
 void lcd_show_message(const char* msg)
 {
-    lcd_clear();
+    LCD_LOCK();
+
+    // Clear display
+    lcd_send_cmd(0x01);
+    vTaskDelay(pdMS_TO_TICKS(3));
+
+    // Write line 1
     lcd_set_cursor(0, 0);
 
-    // Print up to 16 chars on first line
     int i = 0;
-    while (msg[i] != '\0' && i < 16) {
+    while (msg[i] != '\0' && msg[i] != '\n') {
         lcd_write_char(msg[i]);
         i++;
     }
+
+    // Clear rest of line 1
+    for (int col = i; col < 16; col++) {
+        lcd_write_char(' ');
+    }
+
+    // Move to second line
+    lcd_set_cursor(0, 1);
+
+    // If no newline, clear line 2 and exit
+    if (msg[i] != '\n') {
+        lcd_write_string("                "); // 16 spaces
+        LCD_UNLOCK();
+        return;
+    }
+
+    // Has newline → print line 2
+    i++; // skip newline
+    int col = 0;
+
+    while (msg[i] != '\0' && col < 16) {
+        lcd_write_char(msg[i]);
+        i++;
+        col++;
+    }
+
+    // Clear rest of line 2
+    for (; col < 16; col++) lcd_write_char(' ');
+
+    LCD_UNLOCK();
 }
 
 // High-level helper: show countdown on second line
 void lcd_show_countdown(int seconds_left)
 {
-    // "EXIT: 15s"
     char buf[17] = {0};
     snprintf(buf, sizeof(buf), "EXIT: %2ds", seconds_left);
 
+    LCD_LOCK();
+
     lcd_set_cursor(0, 1);
-    // clear the rest of the line
-    lcd_write_string("                "); // 16 spaces
+    lcd_write_string("                "); // clear whole line
     lcd_set_cursor(0, 1);
     lcd_write_string(buf);
+
+    LCD_UNLOCK();
 }
